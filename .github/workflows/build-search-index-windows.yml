@@ -26,7 +26,7 @@ jobs:
       - name: Obtener search-index v0.1.3
         shell: pwsh
         run: |
-          git clone --branch v0.1.3 --depth 1 https://github.com/bastiscode/search-index.git source
+          git -c core.autocrlf=false -c core.eol=lf clone --branch v0.1.3 --depth 1 https://github.com/bastiscode/search-index.git source
           $commit = (git -C source rev-parse HEAD).Trim()
           if ($commit -ne "b9c239c8448b1c1232e448973fd310b0345563de") {
             throw "La etiqueta no resolvio el commit fijado: $commit"
