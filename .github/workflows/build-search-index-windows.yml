@@ -1,0 +1,239 @@
+# Compilacion preparada, no ejecutada.
+# Copiar solo este archivo a .github/workflows/ de un repositorio publico vacio.
+# No lanzarlo hasta una autorizacion distinta de esta revision.
+name: search-index-v0.1.3-windows
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-2022
+    timeout-minutes: 60
+    steps:
+      - name: Registrar el ejecutor
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path diagnostico | Out-Null
+          "runner_os=$env:RUNNER_OS" | Tee-Object -FilePath diagnostico\ejecutor.txt
+          "runner_arch=$env:RUNNER_ARCH" | Tee-Object -FilePath diagnostico\ejecutor.txt -Append
+          "runner_name=$env:RUNNER_NAME" | Tee-Object -FilePath diagnostico\ejecutor.txt -Append
+          git --version | Tee-Object -FilePath diagnostico\ejecutor.txt -Append
+
+      - name: Obtener search-index v0.1.3
+        shell: pwsh
+        run: |
+          git clone --branch v0.1.3 --depth 1 https://github.com/bastiscode/search-index.git source
+          $commit = (git -C source rev-parse HEAD).Trim()
+          if ($commit -ne "b9c239c8448b1c1232e448973fd310b0345563de") {
+            throw "La etiqueta no resolvio el commit fijado: $commit"
+          }
+          $hash = (Get-FileHash -Algorithm SHA256 source\Cargo.lock).Hash.ToLower()
+          if ($hash -ne "29cdb1bcf24dd34fc637c28dea4507c94c61f5902608c85f85da6449820cc9d1") {
+            throw "Cargo.lock distinto del tag v0.1.3: $hash"
+          }
+          Set-Content -Path diagnostico\commit.txt -Value $commit
+          Set-Content -Path diagnostico\cargo-lock.sha256 -Value $hash
+
+      - name: Python 3.11.8 x64
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0
+        with:
+          python-version: "3.11.8"
+          architecture: "x64"
+
+      - name: Rust 1.85.1
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8
+        with:
+          toolchain: "1.85.1"
+          targets: x86_64-pc-windows-msvc
+
+      - name: Activar MSVC y comprobar el compilador
+        id: herramientas
+        shell: pwsh
+        run: |
+          $registro = "diagnostico\herramientas.txt"
+          "inicio" | Set-Content -Path $registro
+          @'
+          import platform, struct, sys
+          assert sys.implementation.name == "cpython"
+          assert sys.version_info[:3] == (3, 11, 8)
+          assert struct.calcsize("P") == 8
+          assert platform.machine().lower() in ("amd64", "x86_64")
+          print(sys.executable)
+          '@ | Set-Content -Path diagnostico\comprobar_python.py -Encoding utf8NoBOM
+          python diagnostico\comprobar_python.py | Tee-Object -FilePath $registro -Append
+          if ($LASTEXITCODE -ne 0) { throw "Python 3.11.8 x64 no quedo seleccionado" }
+          $rust = rustc -vV
+          if ($LASTEXITCODE -ne 0) { throw "rustc no disponible: $LASTEXITCODE" }
+          $rust | Tee-Object -FilePath $registro -Append
+          if ($rust -notmatch '(?m)^rustc 1\.85\.1 ') { throw "rustc distinto de 1.85.1" }
+          if ($rust -notmatch '(?m)^host: x86_64-pc-windows-msvc') { throw "el host de rustc no es x86_64-pc-windows-msvc" }
+          cargo -V | Tee-Object -FilePath $registro -Append
+          if ($LASTEXITCODE -ne 0) { throw "cargo no disponible: $LASTEXITCODE" }
+          rustup show | Tee-Object -FilePath $registro -Append
+          "maturin-version-fijada=v1.15.0" | Tee-Object -FilePath $registro -Append
+          "maturin-action=e83996d129638aa358a18fbd1dfb82f0b0fb5d3b" | Tee-Object -FilePath $registro -Append
+
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          if (-not (Test-Path -LiteralPath $vswhere)) { throw "vswhere no esta en el ejecutor: $vswhere" }
+          $instalacion = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if ($LASTEXITCODE -ne 0 -or -not $instalacion) { throw "el ejecutor no tiene las herramientas MSVC de VS 2022" }
+          $bat = Join-Path $instalacion.Trim() "VC\Auxiliary\Build\vcvars64.bat"
+          if (-not (Test-Path -LiteralPath $bat)) { throw "vcvars64.bat ausente: $bat" }
+          "vcvars64=$bat" | Tee-Object -FilePath $registro -Append
+          $antes = @($env:PATH -split ';')
+          $volcado = cmd /c "call `"$bat`" >nul && set"
+          if ($LASTEXITCODE -ne 0) { throw "vcvars64.bat termino con $LASTEXITCODE" }
+          $interes = @(
+            "PATH", "INCLUDE", "LIB", "LIBPATH", "WindowsSdkDir", "WindowsSDKVersion",
+            "VCToolsInstallDir", "VCINSTALLDIR", "VSINSTALLDIR", "UniversalCRTSdkDir",
+            "UCRTVersion", "WindowsSdkBinPath", "WindowsLibPath", "EXTERNAL_INCLUDE",
+            "VSCMD_ARG_TGT_ARCH"
+          )
+          foreach ($linea in $volcado) {
+            $corte = $linea.IndexOf("=")
+            if ($corte -lt 1) { continue }
+            $nombre = $linea.Substring(0, $corte)
+            if ($interes -notcontains $nombre) { continue }
+            $valor = $linea.Substring($corte + 1)
+            Set-Item -Path "Env:$nombre" -Value $valor
+          }
+          foreach ($variable in @(
+            "INCLUDE", "LIB", "LIBPATH", "WindowsSdkDir", "WindowsSDKVersion",
+            "VCToolsInstallDir", "VCINSTALLDIR", "VSINSTALLDIR", "UniversalCRTSdkDir", "UCRTVersion"
+          )) {
+            $valor = [Environment]::GetEnvironmentVariable($variable)
+            if ($valor) {
+              "$variable=$valor" | Add-Content -Path $env:GITHUB_ENV -Encoding utf8NoBOM
+              "$variable=$valor" | Tee-Object -FilePath $registro -Append
+            }
+          }
+          if (-not $env:WindowsSdkDir -or -not (Test-Path -LiteralPath $env:WindowsSdkDir)) {
+            throw "Windows SDK no quedo configurado tras vcvars64.bat"
+          }
+          $despues = @($env:PATH -split ';')
+          foreach ($entrada in $despues) {
+            if ($entrada -and ($antes -notcontains $entrada)) {
+              Add-Content -Path $env:GITHUB_PATH -Encoding utf8NoBOM -Value $entrada
+            }
+          }
+          foreach ($herramienta in @("cl", "link")) {
+            $orden = Get-Command $herramienta -ErrorAction SilentlyContinue
+            if (-not $orden) { throw "$herramienta no esta disponible despues de vcvars64.bat" }
+            "$herramienta=$($orden.Source)" | Tee-Object -FilePath $registro -Append
+          }
+          Set-Content -Path diagnostico\probe.c -Value "int main(void) { return 0; }`r`n" -Encoding ascii
+          cl /nologo /Fe:diagnostico\probe.exe diagnostico\probe.c
+          if ($LASTEXITCODE -ne 0) { throw "la sonda de MSVC no enlazo: $LASTEXITCODE" }
+          .\diagnostico\probe.exe
+          if ($LASTEXITCODE -ne 0) { throw "la sonda enlazada no se ejecuto" }
+          "cl_sonda_exit=0" | Tee-Object -FilePath $registro -Append
+          "link_sonda_exit=0" | Tee-Object -FilePath $registro -Append
+
+      - name: Maturin release locked
+        id: maturin
+        uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b
+        with:
+          command: build
+          args: --release --locked
+          target: x86_64-pc-windows-msvc
+          rust-toolchain: "1.85.1"
+          maturin-version: "v1.15.0"
+          working-directory: source
+
+      - name: Comprobar que Cargo.lock no cambio
+        shell: pwsh
+        run: |
+          $hash = (Get-FileHash -Algorithm SHA256 source\Cargo.lock).Hash.ToLower()
+          Set-Content -Path diagnostico\cargo-lock-despues.txt -Value $hash
+          if ($hash -ne "29cdb1bcf24dd34fc637c28dea4507c94c61f5902608c85f85da6449820cc9d1") {
+            throw "Cargo.lock fue modificado durante la compilacion: $hash"
+          }
+          git -C source diff --exit-code
+          if ($LASTEXITCODE -ne 0) { throw "la compilacion modifico archivos versionados" }
+
+      - name: Inspeccionar el wheel
+        id: inspeccion
+        shell: pwsh
+        run: |
+          @'
+          import hashlib, pathlib, sys, zipfile
+          ruedas = list(pathlib.Path("source").rglob("*.whl"))
+          if len(ruedas) != 1:
+              sys.exit("se esperaba un wheel, hay %s" % [str(r) for r in ruedas])
+          rueda = ruedas[0]
+          esperado = "search_index-0.1.3-cp310-abi3-win_amd64.whl"
+          if rueda.name != esperado:
+              sys.exit("nombre %s" % rueda.name)
+          datos = rueda.read_bytes()
+          digest = hashlib.sha256(datos).hexdigest()
+          with zipfile.ZipFile(rueda) as paquete:
+              metas = [n for n in paquete.namelist() if n.endswith(".dist-info/WHEEL")]
+              if len(metas) != 1:
+                  sys.exit("WHEEL metadata ausente")
+              texto = paquete.read(metas[0]).decode("utf-8")
+          if "Tag: cp310-abi3-win_amd64" not in texto:
+              sys.exit(texto)
+          pathlib.Path("diagnostico/wheel.sha256").write_text(digest + "  " + rueda.name + "\n", encoding="utf-8")
+          pathlib.Path("diagnostico/wheel-metadata.txt").write_text(texto, encoding="utf-8")
+          destino = pathlib.Path("wheels")
+          destino.mkdir(exist_ok=True)
+          (destino / rueda.name).write_bytes(datos)
+          print(rueda)
+          print(digest)
+          '@ | Set-Content -Path diagnostico\inspeccionar_wheel.py -Encoding utf8NoBOM
+          python diagnostico\inspeccionar_wheel.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          "maturin-version-fijada=v1.15.0" | Set-Content -Path diagnostico\maturin.txt
+          $orden = Get-Command maturin -ErrorAction SilentlyContinue
+          if ($orden) {
+            maturin --version | Add-Content -Path diagnostico\maturin.txt
+          } else {
+            "maturin_en_path=no_queda_en_PATH" | Add-Content -Path diagnostico\maturin.txt
+          }
+
+      - name: Anotar el resultado real
+        id: cierre
+        if: always()
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path diagnostico | Out-Null
+          @(
+            "herramientas=${{ steps.herramientas.outcome }}"
+            "maturin=${{ steps.maturin.outcome }}"
+            "inspeccion=${{ steps.inspeccion.outcome }}"
+          ) | Set-Content -Path diagnostico\resultado.txt
+          if ("${{ steps.herramientas.outcome }}" -ne "success" -or "${{ steps.maturin.outcome }}" -ne "success" -or "${{ steps.inspeccion.outcome }}" -ne "success") {
+            "job=FALLO" | Add-Content -Path diagnostico\resultado.txt
+            exit 1
+          }
+          "job=EXITO" | Add-Content -Path diagnostico\resultado.txt
+
+      - name: Publicar el diagnostico
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: diagnostico-compilacion
+          retention-days: 1
+          if-no-files-found: warn
+          path: diagnostico/**
+
+      - name: Publicar el wheel solo si la inspeccion acerto
+        if: steps.inspeccion.outcome == 'success'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: search-index-0.1.3-cp310-abi3-win_amd64
+          retention-days: 1
+          path: |
+            wheels/*.whl
+            diagnostico/wheel.sha256
+            diagnostico/wheel-metadata.txt
+            diagnostico/commit.txt
+            diagnostico/cargo-lock.sha256
+            diagnostico/herramientas.txt
+            diagnostico/maturin.txt
+            diagnostico/ejecutor.txt
+            diagnostico/resultado.txt
