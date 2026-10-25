@@ -66,7 +66,7 @@ jobs:
           '@ | Set-Content -Path diagnostico\comprobar_python.py -Encoding utf8NoBOM
           python diagnostico\comprobar_python.py | Tee-Object -FilePath $registro -Append
           if ($LASTEXITCODE -ne 0) { throw "Python 3.11.8 x64 no quedo seleccionado" }
-          $rust = rustc -vV
+          $rust = (rustc -vV) -join "`n"
           if ($LASTEXITCODE -ne 0) { throw "rustc no disponible: $LASTEXITCODE" }
           $rust | Tee-Object -FilePath $registro -Append
           if ($rust -notmatch '(?m)^rustc 1\.85\.1 ') { throw "rustc distinto de 1.85.1" }
